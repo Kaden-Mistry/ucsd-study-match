@@ -12,24 +12,57 @@ actual email provider (see the TODO in that function) — otherwise nobody
 can complete signup except you, watching your own server logs.
 """
 
+import os
 import random
 import secrets
+import smtplib
 import sqlite3
 import string
+from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Optional
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, field_validator
 
+# Loads variables from a local .env file (not committed to git) into the
+# environment, so GMAIL_ADDRESS / GMAIL_APP_PASSWORD below can find them.
+load_dotenv()
+
 DB_PATH = Path(__file__).parent / "study_match.db"
+SCHEMA_PATH = Path(__file__).parent / "schema.sql"
+
+
+def init_db_if_needed():
+    """
+    Creates the database and its tables if they don't exist yet. Runs
+    automatically on startup so a fresh deploy (Railway, or anyone else's
+    machine) never hits 'no such table' — this was previously a manual
+    step that got skipped on the first Railway deploy.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    conn.executescript(SCHEMA_PATH.read_text())
+    conn.commit()
+    conn.close()
+
+# Email credentials are read from environment variables, never hardcoded
+# here. Set them locally via a .env file (see .env.example) — that file is
+# gitignored so it never gets committed or pushed anywhere.
+GMAIL_ADDRESS = os.environ.get("GMAIL_ADDRESS")
+GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
 
 # Only these domains can sign up — adjust if grad/extension students use a
 # different subdomain (e.g. checking with UCSD's actual list is worth doing).
 ALLOWED_EMAIL_DOMAINS = ["ucsd.edu"]
 
 app = FastAPI(title="UCSD Study/Project Partner Matcher")
+
+
+@app.on_event("startup")
+def on_startup():
+    init_db_if_needed()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # tighten before deploying
@@ -46,11 +79,23 @@ def get_db():
 
 def send_verification_email(email: str, code: str):
     """
-    TODO: replace with a real email send — e.g. via SMTP, SendGrid, Postmark,
-    or AWS SES. For now this just logs to the console so you can test the
-    flow yourself locally.
+    Sends the real verification email via Gmail SMTP, using the app password
+    read from environment variables (see .env.example). Falls back to
+    printing the code to the console if credentials aren't set yet, so local
+    testing without email still works.
     """
-    print(f"\n[DEV MODE] Verification code for {email}: {code}\n")
+    if not GMAIL_ADDRESS or not GMAIL_APP_PASSWORD:
+        print(f"\n[DEV MODE — no email credentials set] Code for {email}: {code}\n")
+        return
+
+    msg = MIMEText(f"Your UCSD Study Match verification code is: {code}\n\nThis code expires shortly — if you didn't request this, you can ignore it.")
+    msg["Subject"] = "Your verification code"
+    msg["From"] = f"UCSD Study Match <{GMAIL_ADDRESS}>"
+    msg["To"] = email
+
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+        server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+        server.sendmail(GMAIL_ADDRESS, [email], msg.as_string())
 
 
 def generate_code() -> str:
