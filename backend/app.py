@@ -15,10 +15,9 @@ can complete signup except you, watching your own server logs.
 import os
 import random
 import secrets
-import smtplib
+import resend
 import sqlite3
 import string
-from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Optional
 
@@ -50,8 +49,12 @@ def init_db_if_needed():
 # Email credentials are read from environment variables, never hardcoded
 # here. Set them locally via a .env file (see .env.example) — that file is
 # gitignored so it never gets committed or pushed anywhere.
-GMAIL_ADDRESS = os.environ.get("GMAIL_ADDRESS")
-GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
+# Resend sends over HTTPS (not SMTP), which cloud hosts like Railway don't
+# block — this replaced an earlier Gmail/SMTP approach that got silently
+# blocked at the network level once deployed.
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
+if RESEND_API_KEY:
+    resend.api_key = RESEND_API_KEY
 
 # Only these domains can sign up — adjust if grad/extension students use a
 # different subdomain (e.g. checking with UCSD's actual list is worth doing).
@@ -79,23 +82,25 @@ def get_db():
 
 def send_verification_email(email: str, code: str):
     """
-    Sends the real verification email via Gmail SMTP, using the app password
-    read from environment variables (see .env.example). Falls back to
-    printing the code to the console if credentials aren't set yet, so local
+    Sends the real verification email via Resend's HTTPS API. Falls back to
+    printing the code to the console if no API key is set yet, so local
     testing without email still works.
+
+    Note: on Resend's free tier without a verified sending domain, this can
+    only deliver to the email address the Resend account itself was signed
+    up with — sending to other addresses requires verifying a domain in the
+    Resend dashboard first.
     """
-    if not GMAIL_ADDRESS or not GMAIL_APP_PASSWORD:
+    if not RESEND_API_KEY:
         print(f"\n[DEV MODE — no email credentials set] Code for {email}: {code}\n")
         return
 
-    msg = MIMEText(f"Your UCSD Study Match verification code is: {code}\n\nThis code expires shortly — if you didn't request this, you can ignore it.")
-    msg["Subject"] = "Your verification code"
-    msg["From"] = f"UCSD Study Match <{GMAIL_ADDRESS}>"
-    msg["To"] = email
-
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-        server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
-        server.sendmail(GMAIL_ADDRESS, [email], msg.as_string())
+    resend.Emails.send({
+        "from": "UCSD Study Match <onboarding@resend.dev>",
+        "to": email,
+        "subject": "Your verification code",
+        "html": f"<p>Your UCSD Study Match verification code is: <b>{code}</b></p><p>This code expires shortly — if you didn't request this, you can ignore it.</p>",
+    })
 
 
 def generate_code() -> str:
