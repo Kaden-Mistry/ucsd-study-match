@@ -96,7 +96,7 @@ def send_verification_email(email: str, code: str):
         return
 
     resend.Emails.send({
-        "from": "UCSD Study Match <onboarding@resend.dev>",
+        "from": "UCSD Study Match <noreply@ucsdstudymatch.com>",
         "to": email,
         "subject": "Your verification code",
         "html": f"<p>Your UCSD Study Match verification code is: <b>{code}</b></p><p>This code expires shortly — if you didn't request this, you can ignore it.</p>",
