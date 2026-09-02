@@ -57,6 +57,13 @@
   .thread-msg.mine { align-self: flex-end; background: var(--navy); color: white; border-bottom-right-radius: 2px; }
   .thread-msg.theirs { align-self: flex-start; background: #EEF0F2; color: var(--text); border-bottom-left-radius: 2px; }
   .thread-msg-time { font-size: 10px; opacity: 0.7; margin-top: 3px; }
+  .unread-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #B3411E; margin-left: 6px; vertical-align: middle; }
+  .conversation-row.unread .posting-name { font-weight: 700; }
+  .block-link { color: var(--muted); font-size: 12px; cursor: pointer; }
+  .block-link:hover { color: #B3411E; }
+  .posting-actions { display: flex; gap: 8px; margin-top: 8px; }
+  .posting-actions button { margin-top: 0; }
+  .course-row-remove { flex: 0 0 auto !important; width: auto !important; margin-top: 22px !important; padding: 11px 14px !important; }
 </style>
 </head>
 <body>
@@ -107,6 +114,9 @@ let myUserId = localStorage.getItem("user_id") ? Number(localStorage.getItem("us
 // re-fetches whenever it's opened, see render()'s dispatch below).
 let currentTab = "browse"; // "browse" | "inbox"
 let activeConversationId = null; // other user's id, or null for the conversation list
+let hasUnreadConversations = false;
+let editingPostingId = null; // posting currently showing its inline edit form, or null
+let myPostingsCache = [];
 
 function render() {
   const app = document.getElementById("app");
@@ -119,6 +129,7 @@ function render() {
     document.getElementById("browse-form").addEventListener("submit", onBrowse);
     document.getElementById("post-form").addEventListener("submit", onCreatePosting);
     loadMyPostings();
+    refreshUnreadBadge();
   } else if (currentTab === "inbox") {
     if (activeConversationId === null) {
       loadConversations();
@@ -145,6 +156,26 @@ async function init() {
     }
   }
   render();
+}
+
+async function refreshUnreadBadge() {
+  if (!sessionToken) return;
+  try {
+    const res = await fetch(`${API_BASE}/api/conversations`, {
+      headers: { Authorization: `Bearer ${sessionToken}` },
+    });
+    if (!res.ok) return;
+    const data = await res.json();
+    setUnreadBadge(data.some(c => c.unread));
+  } catch {
+    // background refresh — ignore failures, badge just won't update this cycle
+  }
+}
+
+function setUnreadBadge(unread) {
+  hasUnreadConversations = unread;
+  const dot = document.getElementById("inbox-unread-dot");
+  if (dot) dot.hidden = !unread;
 }
 
 // ---------- Auth ----------
@@ -196,6 +227,9 @@ function clearSession() {
   sessionToken = null;
   currentUserName = null;
   myUserId = null;
+  hasUnreadConversations = false;
+  editingPostingId = null;
+  myPostingsCache = [];
   localStorage.removeItem("session_token");
   localStorage.removeItem("display_name");
   localStorage.removeItem("user_id");
@@ -218,7 +252,7 @@ function renderMainApp() {
 
     <div class="tabs">
       <button class="tab ${currentTab === "browse" ? "active" : ""}" onclick="switchTab('browse')">Find &amp; Post</button>
-      <button class="tab ${currentTab === "inbox" ? "active" : ""}" onclick="switchTab('inbox')">Inbox</button>
+      <button class="tab ${currentTab === "inbox" ? "active" : ""}" onclick="switchTab('inbox')">Inbox<span id="inbox-unread-dot" class="unread-dot" ${hasUnreadConversations ? "" : "hidden"}></span></button>
     </div>
 
     ${currentTab === "browse" ? renderBrowseAndPost() : renderInboxSection()}
@@ -228,6 +262,7 @@ function renderMainApp() {
 function switchTab(tab) {
   currentTab = tab;
   activeConversationId = null;
+  editingPostingId = null;
   render();
 }
 
@@ -254,10 +289,13 @@ function renderBrowseAndPost() {
     <div class="card">
       <h3 style="margin-top:0">Post that you're looking for a partner</h3>
       <form id="post-form">
-        <div class="row">
-          <div><label>Subject</label><input id="post-subject" placeholder="CSE" required></div>
-          <div><label>Course #</label><input id="post-num" placeholder="100" required></div>
+        <div id="post-course-rows">
+          <div class="row post-course-row">
+            <div><label>Subject</label><input class="post-subject" placeholder="CSE" required></div>
+            <div><label>Course #</label><input class="post-num" placeholder="100" required></div>
+          </div>
         </div>
+        <button type="button" class="secondary" onclick="addPostCourseRow()">+ Add another course</button>
         <label>I'm looking for</label>
         <select id="post-pref">
           <option value="study">Study partner</option>
@@ -278,6 +316,71 @@ function renderBrowseAndPost() {
   `;
 }
 
+function newPostCourseRowHtml() {
+  return `
+    <div><label>Subject</label><input class="post-subject" placeholder="CSE" required></div>
+    <div><label>Course #</label><input class="post-num" placeholder="100" required></div>
+  `;
+}
+
+function addPostCourseRow() {
+  const container = document.getElementById("post-course-rows");
+  const row = document.createElement("div");
+  row.className = "row post-course-row";
+  row.innerHTML = newPostCourseRowHtml() + `<button type="button" class="secondary course-row-remove">&times;</button>`;
+  container.appendChild(row);
+  row.querySelector(".course-row-remove").addEventListener("click", () => row.remove());
+}
+
+async function onCreatePosting(e) {
+  e.preventDefault();
+  const preference = document.getElementById("post-pref").value;
+  const note = document.getElementById("post-note").value.trim();
+  const msgEl = document.getElementById("post-msg");
+
+  const courses = Array.from(document.querySelectorAll("#post-course-rows .post-course-row")).map(row => ({
+    subject: row.querySelector(".post-subject").value.trim(),
+    catalog_number: row.querySelector(".post-num").value.trim(),
+  })).filter(c => c.subject && c.catalog_number);
+  if (courses.length === 0) return;
+
+  msgEl.innerHTML = "";
+  const results = [];
+  for (const course of courses) {
+    try {
+      const res = await fetch(`${API_BASE}/api/postings`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${sessionToken}` },
+        body: JSON.stringify({ subject: course.subject, catalog_number: course.catalog_number, preference, note: note || null }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Failed to post");
+      results.push({ course, ok: true });
+    } catch (err) {
+      results.push({ course, ok: false, error: err.message });
+    }
+  }
+
+  const succeeded = results.filter(r => r.ok);
+  const failed = results.filter(r => !r.ok);
+  let msg = "";
+  if (succeeded.length > 0) {
+    const list = succeeded.map(r => escapeHtml(`${r.course.subject} ${r.course.catalog_number}`)).join(", ");
+    msg += `<div class="success">Posted ${succeeded.length} course${succeeded.length > 1 ? "s" : ""}: ${list}.</div>`;
+  }
+  if (failed.length > 0) {
+    const list = failed.map(r => `${escapeHtml(r.course.subject + " " + r.course.catalog_number)} (${escapeHtml(r.error)})`).join(", ");
+    msg += `<div class="error">Failed: ${list}.</div>`;
+  }
+  msgEl.innerHTML = msg;
+
+  if (succeeded.length > 0) {
+    document.getElementById("post-course-rows").innerHTML = `<div class="row post-course-row">${newPostCourseRowHtml()}</div>`;
+    document.getElementById("post-note").value = "";
+    loadMyPostings();
+  }
+}
+
 async function loadMyPostings() {
   const listEl = document.getElementById("my-postings-list");
   if (!listEl) return;
@@ -287,26 +390,95 @@ async function loadMyPostings() {
     });
     const postings = await res.json();
     if (!res.ok) throw new Error(postings.detail || "Failed to load your postings");
+    myPostingsCache = postings;
+    renderMyPostingsList();
+  } catch (err) {
+    listEl.innerHTML = `<div class="error">${escapeHtml(err.message)}</div>`;
+  }
+}
 
-    if (postings.length === 0) {
-      listEl.innerHTML = `<div class="muted-note">You haven't posted anything yet.</div>`;
-      return;
-    }
-    listEl.innerHTML = postings.map(p => `
+function renderMyPostingsList() {
+  const listEl = document.getElementById("my-postings-list");
+  if (!listEl) return;
+  if (myPostingsCache.length === 0) {
+    listEl.innerHTML = `<div class="muted-note">You haven't posted anything yet.</div>`;
+    return;
+  }
+  listEl.innerHTML = myPostingsCache.map(renderMyPostingRow).join("");
+  listEl.querySelectorAll("button[data-delete-id]").forEach(btn => {
+    btn.addEventListener("click", () => deleteMyPosting(Number(btn.dataset.deleteId)));
+  });
+  listEl.querySelectorAll("button[data-edit-id]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      editingPostingId = Number(btn.dataset.editId);
+      renderMyPostingsList();
+    });
+  });
+  listEl.querySelectorAll("button[data-cancel-edit]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      editingPostingId = null;
+      renderMyPostingsList();
+    });
+  });
+  listEl.querySelectorAll("button[data-save-id]").forEach(btn => {
+    btn.addEventListener("click", () => saveEditedPosting(Number(btn.dataset.saveId)));
+  });
+}
+
+function renderMyPostingRow(p) {
+  if (editingPostingId === p.posting_id) {
+    return `
       <div class="posting">
         <div class="posting-top">
           <span class="posting-name">${escapeHtml(p.subject)} ${escapeHtml(p.catalog_number)}</span>
-          <span class="badge ${p.preference}">${p.preference}</span>
         </div>
-        ${p.note ? `<div class="posting-note">${escapeHtml(p.note)}</div>` : ""}
-        <button class="secondary" data-posting-id="${p.posting_id}">Delete</button>
+        <label>Looking for</label>
+        <select id="edit-pref-${p.posting_id}">
+          <option value="study" ${p.preference === "study" ? "selected" : ""}>Study partner</option>
+          <option value="project" ${p.preference === "project" ? "selected" : ""}>Project partner</option>
+          <option value="both" ${p.preference === "both" ? "selected" : ""}>Either</option>
+        </select>
+        <label>Note (optional)</label>
+        <textarea id="edit-note-${p.posting_id}">${escapeHtml(p.note || "")}</textarea>
+        <div class="posting-actions">
+          <button class="primary" style="margin-top:8px" data-save-id="${p.posting_id}">Save</button>
+          <button class="secondary" data-cancel-edit="1">Cancel</button>
+        </div>
+        <div id="edit-msg-${p.posting_id}"></div>
       </div>
-    `).join("");
-    listEl.querySelectorAll("button[data-posting-id]").forEach(btn => {
-      btn.addEventListener("click", () => deleteMyPosting(Number(btn.dataset.postingId)));
+    `;
+  }
+  return `
+    <div class="posting">
+      <div class="posting-top">
+        <span class="posting-name">${escapeHtml(p.subject)} ${escapeHtml(p.catalog_number)}</span>
+        <span class="badge ${p.preference}">${p.preference}</span>
+      </div>
+      ${p.note ? `<div class="posting-note">${escapeHtml(p.note)}</div>` : ""}
+      <div class="posting-actions">
+        <button class="secondary" data-edit-id="${p.posting_id}">Edit</button>
+        <button class="secondary" data-delete-id="${p.posting_id}">Delete</button>
+      </div>
+    </div>
+  `;
+}
+
+async function saveEditedPosting(postingId) {
+  const preference = document.getElementById(`edit-pref-${postingId}`).value;
+  const note = document.getElementById(`edit-note-${postingId}`).value.trim();
+  const msgEl = document.getElementById(`edit-msg-${postingId}`);
+  try {
+    const res = await fetch(`${API_BASE}/api/postings/${postingId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${sessionToken}` },
+      body: JSON.stringify({ preference, note: note || null }),
     });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "Failed to save changes");
+    editingPostingId = null;
+    loadMyPostings();
   } catch (err) {
-    listEl.innerHTML = `<div class="error">${escapeHtml(err.message)}</div>`;
+    if (msgEl) msgEl.innerHTML = `<div class="error">${escapeHtml(err.message)}</div>`;
   }
 }
 
@@ -341,6 +513,7 @@ function renderInboxSection() {
     <div class="card">
       <div class="thread-header">
         <span class="signout" onclick="closeConversation()">&larr; Back to Inbox</span>
+        <span class="block-link" onclick="blockCurrentThreadUser()">Block</span>
       </div>
       <h3 id="thread-name" style="margin:8px 0 0">…</h3>
       <div id="thread-messages" class="thread-messages"><div class="muted-note">Loading…</div></div>
@@ -361,14 +534,16 @@ async function loadConversations() {
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || "Failed to load inbox");
 
+    setUnreadBadge(data.some(c => c.unread));
+
     if (data.length === 0) {
       listEl.innerHTML = `<div class="muted-note">No conversations yet — message someone from Find a partner to start one.</div>`;
       return;
     }
     listEl.innerHTML = data.map(c => `
-      <div class="conversation-row" data-other-id="${c.other_user_id}">
+      <div class="conversation-row ${c.unread ? "unread" : ""}" data-other-id="${c.other_user_id}">
         <div class="posting-top">
-          <span class="posting-name">${escapeHtml(c.other_display_name || "A student")}</span>
+          <span class="posting-name">${escapeHtml(c.other_display_name || "A student")}${c.unread ? '<span class="unread-dot"></span>' : ""}</span>
           <span class="muted-note">${formatTime(c.last_message_at)}</span>
         </div>
         <div class="conversation-preview">${escapeHtml(c.last_message)}</div>
@@ -414,8 +589,27 @@ async function loadThread(otherUserId) {
       `).join("");
       msgsEl.scrollTop = msgsEl.scrollHeight;
     }
+    // Opening the thread just marked it read server-side — refresh the badge to match.
+    refreshUnreadBadge();
   } catch (err) {
     msgsEl.innerHTML = `<div class="error">${escapeHtml(err.message)}</div>`;
+  }
+}
+
+async function blockCurrentThreadUser() {
+  if (activeConversationId === null) return;
+  if (!confirm("Block this user? Their conversation will disappear from your inbox, and they won't be able to message you.")) return;
+  try {
+    const res = await fetch(`${API_BASE}/api/users/${activeConversationId}/block`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${sessionToken}` },
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "Failed to block user");
+    closeConversation();
+  } catch (err) {
+    const msgEl = document.getElementById("thread-send-msg");
+    if (msgEl) msgEl.innerHTML = `<div class="error">${escapeHtml(err.message)}</div>`;
   }
 }
 
@@ -505,29 +699,6 @@ async function sendMsg(postingId) {
     resultEl.innerHTML = `<div class="success">Sent!</div>`;
   } catch (err) {
     resultEl.innerHTML = `<div class="error">${escapeHtml(err.message)}</div>`;
-  }
-}
-
-async function onCreatePosting(e) {
-  e.preventDefault();
-  const subject = document.getElementById("post-subject").value.trim();
-  const num = document.getElementById("post-num").value.trim();
-  const preference = document.getElementById("post-pref").value;
-  const note = document.getElementById("post-note").value.trim();
-  const msgEl = document.getElementById("post-msg");
-
-  try {
-    const res = await fetch(`${API_BASE}/api/postings`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${sessionToken}` },
-      body: JSON.stringify({ subject, catalog_number: num, preference, note: note || null }),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || "Failed to post");
-    msgEl.innerHTML = `<div class="success">Posted! Other students in ${escapeHtml(subject)} ${escapeHtml(num)} can now find you.</div>`;
-    loadMyPostings();
-  } catch (err) {
-    msgEl.innerHTML = `<div class="error">${escapeHtml(err.message)}</div>`;
   }
 }
 

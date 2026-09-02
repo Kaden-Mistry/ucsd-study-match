@@ -12,12 +12,14 @@ no firebase-admin SDK or service-account secret needed, since we only ever
 verify tokens, never mint or manage them. See FIREBASE_PROJECT_ID below.
 """
 
+import html
 import os
 import secrets
 import sqlite3
 from pathlib import Path
 from typing import Optional
 
+import resend
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -100,6 +102,31 @@ _google_auth_request = google_auth_requests.Request()
 # .env.example for what this protects and why.
 ADMIN_SECRET = os.environ.get("ADMIN_SECRET")
 
+# Powers the "you have a new message" email notification. Optional — if
+# unset, send_new_message_email() below just no-ops, same as the old
+# verification-email flow did before Firebase Auth replaced it.
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
+if RESEND_API_KEY:
+    resend.api_key = RESEND_API_KEY
+
+
+def send_new_message_email(to_email: str, sender_name: str):
+    """
+    Best-effort notification email — never raises, so a Resend outage or a
+    missing API key can't block a message from actually sending.
+    """
+    if not RESEND_API_KEY:
+        return
+    try:
+        resend.Emails.send({
+            "from": "UCSD Study Match <noreply@ucsdstudymatch.com>",
+            "to": to_email,
+            "subject": "New message on Study & Project Match",
+            "html": f"<p>You have a new message on Study & Project Match from {html.escape(sender_name)}.</p>",
+        })
+    except Exception:
+        pass
+
 app = FastAPI(title="UCSD Study/Project Partner Matcher")
 
 
@@ -145,6 +172,18 @@ class GoogleAuthRequest(BaseModel):
 class PostingCreate(BaseModel):
     subject: str
     catalog_number: str
+    preference: str  # 'study' | 'project' | 'both'
+    note: Optional[str] = None
+
+    @field_validator("preference")
+    @classmethod
+    def valid_preference(cls, v: str) -> str:
+        if v not in ("study", "project", "both"):
+            raise ValueError("preference must be 'study', 'project', or 'both'")
+        return v
+
+
+class PostingUpdate(BaseModel):
     preference: str  # 'study' | 'project' | 'both'
     note: Optional[str] = None
 
@@ -296,8 +335,11 @@ def list_postings(
         WHERE c.subject = ? AND c.catalog_number = ?
           AND p.is_active = 1
           AND u.id != ?
+          AND NOT EXISTS (
+              SELECT 1 FROM blocks b WHERE b.blocker_id = ? AND b.blocked_id = u.id
+          )
     """
-    params = [subject.strip().upper(), catalog_number.strip().upper(), user["id"]]
+    params = [subject.strip().upper(), catalog_number.strip().upper(), user["id"], user["id"]]
 
     if preference:
         # 'both' postings show up regardless of which specific preference is requested
@@ -329,6 +371,29 @@ def list_my_postings(authorization: Optional[str] = Header(None)):
     return [dict(r) for r in rows]
 
 
+@app.patch("/api/postings/{posting_id}")
+def update_posting(posting_id: int, req: PostingUpdate, authorization: Optional[str] = Header(None)):
+    """Owner-only edit of what they're looking for and their note (subject/course are immutable)."""
+    user = get_current_user(authorization)
+    conn = get_db()
+
+    posting = conn.execute("SELECT * FROM postings WHERE id = ?", (posting_id,)).fetchone()
+    if posting is None:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Posting not found")
+    if posting["user_id"] != user["id"]:
+        conn.close()
+        raise HTTPException(status_code=403, detail="Not your posting")
+
+    conn.execute(
+        "UPDATE postings SET preference = ?, note = ? WHERE id = ?",
+        (req.preference, req.note, posting_id),
+    )
+    conn.commit()
+    conn.close()
+    return {"message": "Posting updated"}
+
+
 @app.delete("/api/postings/{posting_id}")
 def delete_posting(posting_id: int, authorization: Optional[str] = Header(None)):
     """
@@ -356,18 +421,34 @@ def delete_posting(posting_id: int, authorization: Optional[str] = Header(None))
 
 # ---------- Messaging endpoints ----------
 
+def _is_blocked(conn: sqlite3.Connection, blocker_id: int, blocked_id: int) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM blocks WHERE blocker_id = ? AND blocked_id = ?", (blocker_id, blocked_id)
+        ).fetchone()
+        is not None
+    )
+
+
 @app.post("/api/messages")
 def send_message(req: MessageCreate, authorization: Optional[str] = Header(None)):
     user = get_current_user(authorization)
     conn = get_db()
 
-    posting = conn.execute("SELECT * FROM postings WHERE id = ?", (req.posting_id,)).fetchone()
+    posting = conn.execute(
+        """SELECT p.*, u.email AS owner_email FROM postings p
+           JOIN users u ON u.id = p.user_id WHERE p.id = ?""",
+        (req.posting_id,),
+    ).fetchone()
     if posting is None:
         conn.close()
         raise HTTPException(status_code=404, detail="Posting not found")
     if posting["user_id"] == user["id"]:
         conn.close()
         raise HTTPException(status_code=400, detail="Can't message your own posting")
+    if _is_blocked(conn, posting["user_id"], user["id"]):
+        conn.close()
+        raise HTTPException(status_code=403, detail="You can't message this user")
 
     conn.execute(
         "INSERT INTO messages (posting_id, from_user_id, to_user_id, body) VALUES (?, ?, ?, ?)",
@@ -375,6 +456,8 @@ def send_message(req: MessageCreate, authorization: Optional[str] = Header(None)
     )
     conn.commit()
     conn.close()
+
+    send_new_message_email(posting["owner_email"], user["display_name"] or user["email"].split("@")[0])
     return {"message": "Sent"}
 
 
@@ -383,7 +466,9 @@ def list_conversations(authorization: Optional[str] = Header(None)):
     """
     The current user's conversations, one row per other person they've
     exchanged messages with — regardless of which posting (if any) started
-    it — most recently active first.
+    it — most recently active first. Excludes conversations with anyone the
+    current user has blocked. Each row includes whether it has messages
+    from the other person sent since the current user last opened it.
     """
     user = get_current_user(authorization)
     conn = get_db()
@@ -401,10 +486,19 @@ def list_conversations(authorization: Optional[str] = Header(None)):
             WHERE from_user_id = :me OR to_user_id = :me
         )
         SELECT c.other_user_id, u.display_name AS other_display_name,
-               c.body AS last_message, c.created_at AS last_message_at
+               c.body AS last_message, c.created_at AS last_message_at,
+               CASE WHEN EXISTS (
+                   SELECT 1 FROM messages m2
+                   WHERE m2.from_user_id = c.other_user_id AND m2.to_user_id = :me
+                     AND m2.id > COALESCE(cr.last_read_message_id, 0)
+               ) THEN 1 ELSE 0 END AS unread
         FROM convo c
         JOIN users u ON u.id = c.other_user_id
+        LEFT JOIN conversation_reads cr ON cr.user_id = :me AND cr.other_user_id = c.other_user_id
         WHERE c.rn = 1
+          AND NOT EXISTS (
+              SELECT 1 FROM blocks b WHERE b.blocker_id = :me AND b.blocked_id = c.other_user_id
+          )
         ORDER BY c.created_at DESC, c.id DESC
         """,
         {"me": user["id"]},
@@ -415,7 +509,10 @@ def list_conversations(authorization: Optional[str] = Header(None)):
 
 @app.get("/api/conversations/{other_user_id}")
 def get_conversation_thread(other_user_id: int, authorization: Optional[str] = Header(None)):
-    """The full message history between the current user and another user, oldest first."""
+    """
+    The full message history between the current user and another user,
+    oldest first. Opening a thread marks it read (updates conversation_reads).
+    """
     user = get_current_user(authorization)
     conn = get_db()
 
@@ -432,10 +529,23 @@ def get_conversation_thread(other_user_id: int, authorization: Optional[str] = H
            ORDER BY created_at ASC, id ASC""",
         (user["id"], other_user_id, other_user_id, user["id"]),
     ).fetchall()
+
+    is_blocked_by_me = _is_blocked(conn, user["id"], other_user_id)
+
+    last_message_id = rows[-1]["id"] if rows else 0
+    conn.execute(
+        """INSERT INTO conversation_reads (user_id, other_user_id, last_read_message_id)
+           VALUES (?, ?, ?)
+           ON CONFLICT(user_id, other_user_id) DO UPDATE SET
+             last_read_message_id = MAX(last_read_message_id, excluded.last_read_message_id)""",
+        (user["id"], other_user_id, last_message_id),
+    )
+    conn.commit()
     conn.close()
     return {
         "other_user_id": other["id"],
         "other_display_name": other["display_name"],
+        "is_blocked_by_me": is_blocked_by_me,
         "messages": [dict(r) for r in rows],
     }
 
@@ -450,10 +560,13 @@ def send_direct_message(
         raise HTTPException(status_code=400, detail="Can't message yourself")
 
     conn = get_db()
-    other = conn.execute("SELECT id FROM users WHERE id = ?", (other_user_id,)).fetchone()
+    other = conn.execute("SELECT id, email FROM users WHERE id = ?", (other_user_id,)).fetchone()
     if other is None:
         conn.close()
         raise HTTPException(status_code=404, detail="User not found")
+    if _is_blocked(conn, other_user_id, user["id"]):
+        conn.close()
+        raise HTTPException(status_code=403, detail="You can't message this user")
 
     conn.execute(
         "INSERT INTO messages (posting_id, from_user_id, to_user_id, body) VALUES (NULL, ?, ?, ?)",
@@ -461,7 +574,41 @@ def send_direct_message(
     )
     conn.commit()
     conn.close()
+
+    send_new_message_email(other["email"], user["display_name"] or user["email"].split("@")[0])
     return {"message": "Sent"}
+
+
+# ---------- Blocking ----------
+
+@app.post("/api/users/{user_id}/block")
+def block_user(user_id: int, authorization: Optional[str] = Header(None)):
+    user = get_current_user(authorization)
+    if user_id == user["id"]:
+        raise HTTPException(status_code=400, detail="Can't block yourself")
+
+    conn = get_db()
+    other = conn.execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone()
+    if other is None:
+        conn.close()
+        raise HTTPException(status_code=404, detail="User not found")
+
+    conn.execute(
+        "INSERT OR IGNORE INTO blocks (blocker_id, blocked_id) VALUES (?, ?)", (user["id"], user_id)
+    )
+    conn.commit()
+    conn.close()
+    return {"message": "Blocked"}
+
+
+@app.delete("/api/users/{user_id}/block")
+def unblock_user(user_id: int, authorization: Optional[str] = Header(None)):
+    user = get_current_user(authorization)
+    conn = get_db()
+    conn.execute("DELETE FROM blocks WHERE blocker_id = ? AND blocked_id = ?", (user["id"], user_id))
+    conn.commit()
+    conn.close()
+    return {"message": "Unblocked"}
 
 
 # ---------- Admin ----------
