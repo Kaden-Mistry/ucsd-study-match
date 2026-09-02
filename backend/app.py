@@ -613,6 +613,13 @@ def unblock_user(user_id: int, authorization: Optional[str] = Header(None)):
 
 # ---------- Admin ----------
 
+def _check_admin_secret(x_admin_secret: Optional[str]):
+    if not ADMIN_SECRET:
+        raise HTTPException(status_code=500, detail="Server is missing ADMIN_SECRET configuration")
+    if x_admin_secret != ADMIN_SECRET:
+        raise HTTPException(status_code=401, detail="Missing or invalid X-Admin-Secret header")
+
+
 @app.post("/api/admin/reset-data")
 def admin_reset_data(x_admin_secret: Optional[str] = Header(None, alias="X-Admin-Secret")):
     """
@@ -620,10 +627,7 @@ def admin_reset_data(x_admin_secret: Optional[str] = Header(None, alias="X-Admin
     untouched. Meant for clearing out test data before real users show up —
     remove this endpoint (and unset ADMIN_SECRET) once it's no longer needed.
     """
-    if not ADMIN_SECRET:
-        raise HTTPException(status_code=500, detail="Server is missing ADMIN_SECRET configuration")
-    if x_admin_secret != ADMIN_SECRET:
-        raise HTTPException(status_code=401, detail="Missing or invalid X-Admin-Secret header")
+    _check_admin_secret(x_admin_secret)
 
     conn = get_db()
     messages_deleted = conn.execute("DELETE FROM messages").rowcount
@@ -631,6 +635,32 @@ def admin_reset_data(x_admin_secret: Optional[str] = Header(None, alias="X-Admin
     conn.commit()
     conn.close()
     return {"postings_deleted": postings_deleted, "messages_deleted": messages_deleted}
+
+
+@app.get("/api/admin/stats")
+def admin_stats(x_admin_secret: Optional[str] = Header(None, alias="X-Admin-Secret")):
+    """Read-only counts for a quick health check of the deployed data."""
+    _check_admin_secret(x_admin_secret)
+
+    conn = get_db()
+    total_users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    total_active_postings = conn.execute("SELECT COUNT(*) FROM postings WHERE is_active = 1").fetchone()[0]
+    total_messages = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    total_conversations = conn.execute(
+        """
+        SELECT COUNT(*) FROM (
+            SELECT DISTINCT MIN(from_user_id, to_user_id) AS a, MAX(from_user_id, to_user_id) AS b
+            FROM messages
+        )
+        """
+    ).fetchone()[0]
+    conn.close()
+    return {
+        "total_users": total_users,
+        "total_active_postings": total_active_postings,
+        "total_messages": total_messages,
+        "total_conversations": total_conversations,
+    }
 
 
 @app.get("/api/health")
