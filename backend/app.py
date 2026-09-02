@@ -96,6 +96,10 @@ def init_db_if_needed():
 FIREBASE_PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID")
 _google_auth_request = google_auth_requests.Request()
 
+# Guards the one-time POST /api/admin/reset-data cleanup endpoint. See
+# .env.example for what this protects and why.
+ADMIN_SECRET = os.environ.get("ADMIN_SECRET")
+
 app = FastAPI(title="UCSD Study/Project Partner Matcher")
 
 
@@ -306,19 +310,48 @@ def list_postings(
     return [dict(r) for r in rows]
 
 
-@app.delete("/api/postings/{posting_id}")
-def deactivate_posting(posting_id: int, authorization: Optional[str] = Header(None)):
+@app.get("/api/postings/mine")
+def list_my_postings(authorization: Optional[str] = Header(None)):
+    """The current user's own active postings, most recent first."""
     user = get_current_user(authorization)
     conn = get_db()
-    result = conn.execute(
-        "UPDATE postings SET is_active = 0 WHERE id = ? AND user_id = ?",
-        (posting_id, user["id"]),
-    )
+    rows = conn.execute(
+        """
+        SELECT p.id AS posting_id, c.subject, c.catalog_number, p.preference, p.note, p.created_at
+        FROM postings p
+        JOIN courses c ON c.id = p.course_id
+        WHERE p.user_id = ? AND p.is_active = 1
+        ORDER BY p.created_at DESC, p.id DESC
+        """,
+        (user["id"],),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+@app.delete("/api/postings/{posting_id}")
+def delete_posting(posting_id: int, authorization: Optional[str] = Header(None)):
+    """
+    Permanently deletes a posting (not a soft is_active=0 flip) along with
+    any messages tied to it, so deleting a posting doesn't leave messages
+    pointing at a posting_id that no longer exists.
+    """
+    user = get_current_user(authorization)
+    conn = get_db()
+
+    posting = conn.execute("SELECT * FROM postings WHERE id = ?", (posting_id,)).fetchone()
+    if posting is None:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Posting not found")
+    if posting["user_id"] != user["id"]:
+        conn.close()
+        raise HTTPException(status_code=403, detail="Not your posting")
+
+    conn.execute("DELETE FROM messages WHERE posting_id = ?", (posting_id,))
+    conn.execute("DELETE FROM postings WHERE id = ?", (posting_id,))
     conn.commit()
     conn.close()
-    if result.rowcount == 0:
-        raise HTTPException(status_code=404, detail="Posting not found or not yours")
-    return {"message": "Posting removed"}
+    return {"message": "Posting deleted"}
 
 
 # ---------- Messaging endpoints ----------
@@ -429,6 +462,28 @@ def send_direct_message(
     conn.commit()
     conn.close()
     return {"message": "Sent"}
+
+
+# ---------- Admin ----------
+
+@app.post("/api/admin/reset-data")
+def admin_reset_data(x_admin_secret: Optional[str] = Header(None, alias="X-Admin-Secret")):
+    """
+    One-time cleanup: wipes all postings and messages, leaving users
+    untouched. Meant for clearing out test data before real users show up —
+    remove this endpoint (and unset ADMIN_SECRET) once it's no longer needed.
+    """
+    if not ADMIN_SECRET:
+        raise HTTPException(status_code=500, detail="Server is missing ADMIN_SECRET configuration")
+    if x_admin_secret != ADMIN_SECRET:
+        raise HTTPException(status_code=401, detail="Missing or invalid X-Admin-Secret header")
+
+    conn = get_db()
+    messages_deleted = conn.execute("DELETE FROM messages").rowcount
+    postings_deleted = conn.execute("DELETE FROM postings").rowcount
+    conn.commit()
+    conn.close()
+    return {"postings_deleted": postings_deleted, "messages_deleted": messages_deleted}
 
 
 @app.get("/api/health")

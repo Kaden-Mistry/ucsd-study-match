@@ -118,6 +118,7 @@ function render() {
   if (currentTab === "browse") {
     document.getElementById("browse-form").addEventListener("submit", onBrowse);
     document.getElementById("post-form").addEventListener("submit", onCreatePosting);
+    loadMyPostings();
   } else if (currentTab === "inbox") {
     if (activeConversationId === null) {
       loadConversations();
@@ -269,7 +270,60 @@ function renderBrowseAndPost() {
         <div id="post-msg"></div>
       </form>
     </div>
+
+    <div class="card">
+      <h3 style="margin-top:0">Your postings</h3>
+      <div id="my-postings-list"><div class="muted-note">Loading…</div></div>
+    </div>
   `;
+}
+
+async function loadMyPostings() {
+  const listEl = document.getElementById("my-postings-list");
+  if (!listEl) return;
+  try {
+    const res = await fetch(`${API_BASE}/api/postings/mine`, {
+      headers: { Authorization: `Bearer ${sessionToken}` },
+    });
+    const postings = await res.json();
+    if (!res.ok) throw new Error(postings.detail || "Failed to load your postings");
+
+    if (postings.length === 0) {
+      listEl.innerHTML = `<div class="muted-note">You haven't posted anything yet.</div>`;
+      return;
+    }
+    listEl.innerHTML = postings.map(p => `
+      <div class="posting">
+        <div class="posting-top">
+          <span class="posting-name">${escapeHtml(p.subject)} ${escapeHtml(p.catalog_number)}</span>
+          <span class="badge ${p.preference}">${p.preference}</span>
+        </div>
+        ${p.note ? `<div class="posting-note">${escapeHtml(p.note)}</div>` : ""}
+        <button class="secondary" data-posting-id="${p.posting_id}">Delete</button>
+      </div>
+    `).join("");
+    listEl.querySelectorAll("button[data-posting-id]").forEach(btn => {
+      btn.addEventListener("click", () => deleteMyPosting(Number(btn.dataset.postingId)));
+    });
+  } catch (err) {
+    listEl.innerHTML = `<div class="error">${escapeHtml(err.message)}</div>`;
+  }
+}
+
+async function deleteMyPosting(postingId) {
+  if (!confirm("Delete this posting? This can't be undone.")) return;
+  try {
+    const res = await fetch(`${API_BASE}/api/postings/${postingId}`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${sessionToken}` },
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "Failed to delete posting");
+    loadMyPostings();
+  } catch (err) {
+    const listEl = document.getElementById("my-postings-list");
+    if (listEl) listEl.innerHTML = `<div class="error">${escapeHtml(err.message)}</div>`;
+  }
 }
 
 // ---------- Inbox ----------
@@ -471,6 +525,7 @@ async function onCreatePosting(e) {
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || "Failed to post");
     msgEl.innerHTML = `<div class="success">Posted! Other students in ${escapeHtml(subject)} ${escapeHtml(num)} can now find you.</div>`;
+    loadMyPostings();
   } catch (err) {
     msgEl.innerHTML = `<div class="error">${escapeHtml(err.message)}</div>`;
   }
