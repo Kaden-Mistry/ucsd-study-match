@@ -1,17 +1,22 @@
 -- UCSD Study/Project Partner Matcher — Database Schema
 PRAGMA foreign_keys = ON;
 
--- Verified UCSD students (via .edu email verification, no scraped data)
+-- Verified UCSD students (via Firebase Google Sign-In, restricted to an
+-- allowed .edu domain — no scraped data)
 CREATE TABLE IF NOT EXISTS users (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     email               TEXT NOT NULL UNIQUE,       -- must end in an allowed .edu domain
     display_name        TEXT,                        -- optional, e.g. first name only for privacy
+    firebase_uid        TEXT,                        -- Firebase Auth uid this email is bound to
     is_verified         INTEGER NOT NULL DEFAULT 0,  -- 0/1
-    verification_code   TEXT,                        -- current pending code, NULL once used
-    verification_sent_at TEXT,
     session_token       TEXT UNIQUE,                 -- simple bearer token, reissued each login
     created_at          TEXT DEFAULT (datetime('now'))
 );
+
+-- The unique index on users(firebase_uid) is created in migrate_db() in
+-- app.py, not here: on a pre-Firebase database this CREATE TABLE is a
+-- no-op (the table already exists without the column), so an index
+-- statement here would fail until migrate_db() has added the column.
 
 CREATE TABLE IF NOT EXISTS courses (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,

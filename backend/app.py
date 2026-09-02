@@ -5,58 +5,73 @@ Run locally:
     pip install fastapi uvicorn
     uvicorn app:app --reload
 
-⚠️ EMAIL SENDING: send_verification_email() below is a STUB — it prints the
-code to the server console instead of actually emailing it. My sandbox can't
-send real email. Before this is usable by real people, wire it up to an
-actual email provider (see the TODO in that function) — otherwise nobody
-can complete signup except you, watching your own server logs.
+Auth: Firebase Authentication (Google Sign-In) on the frontend, verified
+here by checking the Firebase ID token's signature and claims directly
+against Google's public certs (via google-auth's verify_firebase_token) —
+no firebase-admin SDK or service-account secret needed, since we only ever
+verify tokens, never mint or manage them. See FIREBASE_PROJECT_ID below.
 """
 
 import os
-import random
 import secrets
-import resend
 import sqlite3
-import string
 from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr, field_validator
+from google.auth.transport import requests as google_auth_requests
+from google.oauth2 import id_token as google_id_token
+from pydantic import BaseModel, field_validator
 
 # Loads variables from a local .env file (not committed to git) into the
-# environment, so GMAIL_ADDRESS / GMAIL_APP_PASSWORD below can find them.
+# environment, so FIREBASE_PROJECT_ID below can find it.
 load_dotenv()
 
 DB_PATH = Path(__file__).parent / "study_match.db"
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
 
+def migrate_db(conn: sqlite3.Connection):
+    """
+    Brings a database created before the Firebase Auth switchover up to
+    date. CREATE TABLE IF NOT EXISTS in schema.sql only handles brand-new
+    databases — an existing users table (e.g. the one already deployed on
+    Railway) needs its new column added explicitly.
+    """
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(users)")}
+    if "firebase_uid" not in cols:
+        conn.execute("ALTER TABLE users ADD COLUMN firebase_uid TEXT")
+    conn.execute(
+        """CREATE UNIQUE INDEX IF NOT EXISTS idx_users_firebase_uid
+           ON users(firebase_uid) WHERE firebase_uid IS NOT NULL"""
+    )
+    conn.commit()
+
+
 def init_db_if_needed():
     """
-    Creates the database and its tables if they don't exist yet. Runs
-    automatically on startup so a fresh deploy (Railway, or anyone else's
-    machine) never hits 'no such table' — this was previously a manual
-    step that got skipped on the first Railway deploy.
+    Creates the database and its tables if they don't exist yet, then runs
+    any pending migrations. Runs automatically on startup so a fresh deploy
+    (Railway, or anyone else's machine) never hits 'no such table' — this
+    was previously a manual step that got skipped on the first Railway
+    deploy.
     """
     conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA_PATH.read_text())
     conn.commit()
+    migrate_db(conn)
     conn.close()
 
-# Email credentials are read from environment variables, never hardcoded
-# here. Set them locally via a .env file (see .env.example) — that file is
-# gitignored so it never gets committed or pushed anywhere.
-# Resend sends over HTTPS (not SMTP), which cloud hosts like Railway don't
-# block — this replaced an earlier Gmail/SMTP approach that got silently
-# blocked at the network level once deployed.
-RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
-if RESEND_API_KEY:
-    resend.api_key = RESEND_API_KEY
+# The Firebase project ID is not a secret — it's part of every ID token's
+# audience/issuer claims — but it must match the project the frontend's
+# firebaseConfig points at, or every sign-in will fail verification below.
+FIREBASE_PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID")
+_google_auth_request = google_auth_requests.Request()
 
-# Only these domains can sign up — adjust if grad/extension students use a
+# Only these domains can sign in — adjust if grad/extension students use a
 # different subdomain (e.g. checking with UCSD's actual list is worth doing).
 ALLOWED_EMAIL_DOMAINS = ["ucsd.edu"]
 
@@ -80,33 +95,6 @@ def get_db():
     return conn
 
 
-def send_verification_email(email: str, code: str):
-    """
-    Sends the real verification email via Resend's HTTPS API. Falls back to
-    printing the code to the console if no API key is set yet, so local
-    testing without email still works.
-
-    Note: on Resend's free tier without a verified sending domain, this can
-    only deliver to the email address the Resend account itself was signed
-    up with — sending to other addresses requires verifying a domain in the
-    Resend dashboard first.
-    """
-    if not RESEND_API_KEY:
-        print(f"\n[DEV MODE — no email credentials set] Code for {email}: {code}\n")
-        return
-
-    resend.Emails.send({
-        "from": "UCSD Study Match <noreply@ucsdstudymatch.com>",
-        "to": email,
-        "subject": "Your verification code",
-        "html": f"<p>Your UCSD Study Match verification code is: <b>{code}</b></p><p>This code expires shortly — if you didn't request this, you can ignore it.</p>",
-    })
-
-
-def generate_code() -> str:
-    return "".join(random.choices(string.digits, k=6))
-
-
 def get_current_user(authorization: Optional[str] = Header(None)) -> sqlite3.Row:
     """Bearer-token auth. Pass 'Authorization: Bearer <token>' on protected requests."""
     if not authorization or not authorization.startswith("Bearer "):
@@ -125,22 +113,8 @@ def get_current_user(authorization: Optional[str] = Header(None)) -> sqlite3.Row
 
 # ---------- Request/response models ----------
 
-class SignupRequest(BaseModel):
-    email: EmailStr
-
-    @field_validator("email")
-    @classmethod
-    def must_be_allowed_domain(cls, v: str) -> str:
-        domain = v.split("@")[-1].lower()
-        if domain not in ALLOWED_EMAIL_DOMAINS:
-            raise ValueError(f"Email must end in one of: {', '.join(ALLOWED_EMAIL_DOMAINS)}")
-        return v
-
-
-class VerifyRequest(BaseModel):
-    email: EmailStr
-    code: str
-    display_name: Optional[str] = None
+class GoogleAuthRequest(BaseModel):
+    id_token: str
 
 
 class PostingCreate(BaseModel):
@@ -164,53 +138,72 @@ class MessageCreate(BaseModel):
 
 # ---------- Auth endpoints ----------
 
-@app.post("/api/signup")
-def signup(req: SignupRequest):
-    """Start signup: create (or reuse) a user row and send a verification code."""
-    conn = get_db()
-    code = generate_code()
+@app.post("/api/auth/google")
+def auth_google(req: GoogleAuthRequest):
+    """
+    Exchange a Firebase (Google Sign-In) ID token for our own session token.
 
-    existing = conn.execute("SELECT id FROM users WHERE email = ?", (req.email,)).fetchone()
-    if existing:
+    The ID token's signature and claims are checked directly against
+    Google's public certs — this proves the user owns a Google account with
+    a verified email, but says nothing about domain, so that's checked
+    separately below against ALLOWED_EMAIL_DOMAINS. That check is what
+    actually restricts sign-in to UCSD accounts; the frontend's `hd` hint
+    on the Google account picker is just a UX nicety, not a security
+    boundary, since it's client-controlled.
+    """
+    if not FIREBASE_PROJECT_ID:
+        raise HTTPException(status_code=500, detail="Server is missing FIREBASE_PROJECT_ID configuration")
+
+    try:
+        claims = google_id_token.verify_firebase_token(
+            req.id_token, _google_auth_request, audience=FIREBASE_PROJECT_ID
+        )
+    except ValueError:
+        claims = None
+    if claims is None:
+        raise HTTPException(status_code=401, detail="Invalid or expired Google sign-in token")
+
+    if not claims.get("email_verified"):
+        raise HTTPException(status_code=403, detail="Google account email is not verified")
+
+    email = (claims.get("email") or "").lower()
+    domain = email.split("@")[-1]
+    if domain not in ALLOWED_EMAIL_DOMAINS:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Sign-in is restricted to {', '.join(ALLOWED_EMAIL_DOMAINS)} accounts",
+        )
+
+    firebase_uid = claims.get("sub")
+    google_name = claims.get("name")
+    token = secrets.token_urlsafe(32)
+
+    conn = get_db()
+    user = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+    if user is None:
         conn.execute(
-            "UPDATE users SET verification_code = ?, verification_sent_at = datetime('now') WHERE email = ?",
-            (code, req.email),
+            """INSERT INTO users (email, display_name, firebase_uid, is_verified, session_token)
+               VALUES (?, ?, ?, 1, ?)""",
+            (email, google_name, firebase_uid, token),
         )
     else:
         conn.execute(
-            "INSERT INTO users (email, verification_code, verification_sent_at) VALUES (?, ?, datetime('now'))",
-            (req.email, code),
+            """UPDATE users SET display_name = COALESCE(display_name, ?), firebase_uid = ?,
+               is_verified = 1, session_token = ? WHERE id = ?""",
+            (google_name, firebase_uid, token, user["id"]),
         )
     conn.commit()
+    row = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
     conn.close()
 
-    send_verification_email(req.email, code)
-    return {"message": "Verification code sent. Check your email."}
+    return {"session_token": token, "display_name": row["display_name"] or email.split("@")[0]}
 
 
-@app.post("/api/verify")
-def verify(req: VerifyRequest):
-    """Confirm the code and issue a session token."""
-    conn = get_db()
-    user = conn.execute("SELECT * FROM users WHERE email = ?", (req.email,)).fetchone()
-
-    if user is None:
-        conn.close()
-        raise HTTPException(status_code=404, detail="No signup found for this email")
-    if user["verification_code"] != req.code:
-        conn.close()
-        raise HTTPException(status_code=400, detail="Incorrect code")
-
-    token = secrets.token_urlsafe(32)
-    conn.execute(
-        """UPDATE users SET is_verified = 1, verification_code = NULL,
-           session_token = ?, display_name = COALESCE(?, display_name)
-           WHERE id = ?""",
-        (token, req.display_name, user["id"]),
-    )
-    conn.commit()
-    conn.close()
-    return {"session_token": token}
+@app.get("/api/me")
+def get_me(authorization: Optional[str] = Header(None)):
+    """Lets the frontend restore 'signed in as X' after a page refresh without re-authenticating."""
+    user = get_current_user(authorization)
+    return {"email": user["email"], "display_name": user["display_name"]}
 
 
 # ---------- Course/posting endpoints ----------

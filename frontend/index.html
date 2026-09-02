@@ -56,12 +56,39 @@
 
 <main id="app"></main>
 
+<!-- Firebase Authentication (compat build — no bundler in this project) -->
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js"></script>
+
 <script>
 // Point this at wherever you're running the backend
 const API_BASE = "https://ucsd-study-match-production.up.railway.app";
 
-let sessionToken = null; // kept in memory only — no localStorage in this environment
-let currentUserName = null;
+// From the Firebase console: Project settings -> General -> "Your apps" ->
+// Web app -> SDK setup and configuration. These values are public (they're
+// shipped to every browser) — the actual security boundary is the backend's
+// FIREBASE_PROJECT_ID check in /api/auth/google, not secrecy of this object.
+// Also required in the Firebase console:
+//   1. Authentication -> Sign-in method -> enable "Google"
+//   2. Authentication -> Settings -> Authorized domains -> add whatever
+//      domain this file is served from (localhost is included by default,
+//      but opening this file directly as file:// will NOT work — serve it,
+//      e.g. `python3 -m http.server`, during local dev).
+const firebaseConfig = {
+  apiKey: "AIzaSyBwCXWrYIhklVWQjkiFFXTPRFFO4lvfOBk",
+  authDomain: "ucsdstudymatch-3445e.firebaseapp.com",
+  projectId: "ucsdstudymatch-3445e",
+  storageBucket: "ucsdstudymatch-3445e.firebasestorage.app",
+  messagingSenderId: "540861297060",
+  appId: "1:540861297060:web:defc3136147a5039095131",
+};
+firebase.initializeApp(firebaseConfig);
+
+// Persisted in localStorage (not just an in-memory variable) so a page
+// refresh doesn't log the user out — init() below re-validates it against
+// the backend on load and clears it if it's no longer good.
+let sessionToken = localStorage.getItem("session_token");
+let currentUserName = localStorage.getItem("display_name");
 
 function render() {
   const app = document.getElementById("app");
@@ -74,73 +101,81 @@ function render() {
   }
 }
 
+async function init() {
+  if (sessionToken) {
+    try {
+      const res = await fetch(`${API_BASE}/api/me`, {
+        headers: { Authorization: `Bearer ${sessionToken}` },
+      });
+      if (!res.ok) throw new Error("stale session");
+      const data = await res.json();
+      currentUserName = data.display_name || data.email.split("@")[0];
+      localStorage.setItem("display_name", currentUserName);
+    } catch {
+      clearSession();
+    }
+  }
+  render();
+}
+
 // ---------- Auth ----------
 
 function renderAuthCard() {
   return `
     <div class="card">
-      <div id="step-email">
-        <label>UCSD email</label>
-        <input id="email-input" type="email" placeholder="you@ucsd.edu">
-        <button class="primary" onclick="doSignup()">Send verification code</button>
-        <div id="auth-msg"></div>
-      </div>
-      <div id="step-code" class="hidden">
-        <label>6-digit code</label>
-        <input id="code-input" type="text" maxlength="6" placeholder="123456">
-        <label>Display name (optional — shown to other students)</label>
-        <input id="name-input" type="text" placeholder="e.g. Alex">
-        <button class="primary" onclick="doVerify()">Verify & continue</button>
-        <div id="verify-msg"></div>
-      </div>
+      <p style="margin-top:0;color:var(--muted);font-size:13px">
+        Sign in with your UCSD Google account to continue. Only @ucsd.edu
+        accounts can sign in.
+      </p>
+      <button class="primary" onclick="doGoogleSignIn()">Sign in with Google</button>
+      <div id="auth-msg"></div>
     </div>
   `;
 }
 
-let pendingEmail = null;
-
-async function doSignup() {
-  const email = document.getElementById("email-input").value.trim();
+async function doGoogleSignIn() {
   const msgEl = document.getElementById("auth-msg");
   msgEl.innerHTML = "";
+  const provider = new firebase.auth.GoogleAuthProvider();
+  // Hints Google's account picker toward ucsd.edu accounts — a UX nicety
+  // only, not enforcement (a user could still pick another account, so the
+  // backend independently checks the email domain on every sign-in).
+  provider.setCustomParameters({ hd: "ucsd.edu" });
+
   try {
-    const res = await fetch(`${API_BASE}/api/signup`, {
+    const result = await firebase.auth().signInWithPopup(provider);
+    const idToken = await result.user.getIdToken();
+
+    const res = await fetch(`${API_BASE}/api/auth/google`, {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email }),
+      body: JSON.stringify({ id_token: idToken }),
     });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.detail?.[0]?.msg || data.detail || "Signup failed");
-    pendingEmail = email;
-    document.getElementById("step-email").classList.add("hidden");
-    document.getElementById("step-code").classList.remove("hidden");
+    if (!res.ok) throw new Error(data.detail || "Sign-in failed");
+
+    sessionToken = data.session_token;
+    currentUserName = data.display_name;
+    localStorage.setItem("session_token", sessionToken);
+    localStorage.setItem("display_name", currentUserName);
+    render();
   } catch (err) {
-    msgEl.innerHTML = `<div class="error">${escapeHtml(err.message)}</div>`;
+    if (err.code !== "auth/popup-closed-by-user") {
+      msgEl.innerHTML = `<div class="error">${escapeHtml(err.message)}</div>`;
+    }
+    firebase.auth().signOut().catch(() => {});
   }
 }
 
-async function doVerify() {
-  const code = document.getElementById("code-input").value.trim();
-  const name = document.getElementById("name-input").value.trim();
-  const msgEl = document.getElementById("verify-msg");
-  msgEl.innerHTML = "";
-  try {
-    const res = await fetch(`${API_BASE}/api/verify`, {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email: pendingEmail, code, display_name: name || null }),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || "Verification failed");
-    sessionToken = data.session_token;
-    currentUserName = name || pendingEmail.split("@")[0];
-    render();
-  } catch (err) {
-    msgEl.innerHTML = `<div class="error">${escapeHtml(err.message)}</div>`;
-  }
+function clearSession() {
+  sessionToken = null;
+  currentUserName = null;
+  localStorage.removeItem("session_token");
+  localStorage.removeItem("display_name");
 }
 
 function signOut() {
-  sessionToken = null;
-  currentUserName = null;
+  clearSession();
+  firebase.auth().signOut().catch(() => {});
   render();
 }
 
@@ -282,7 +317,7 @@ function escapeHtml(str) {
   return div.innerHTML;
 }
 
-render();
+init();
 </script>
 
 </body>
