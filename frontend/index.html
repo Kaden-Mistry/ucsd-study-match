@@ -45,6 +45,18 @@
   .hidden { display: none; }
   .top-bar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
   .signout { color: var(--muted); font-size: 12px; cursor: pointer; }
+  .tabs { display: flex; gap: 8px; margin-bottom: 16px; }
+  .tab { flex: 1; background: white; border: 1px solid var(--border); border-radius: 8px; padding: 10px; cursor: pointer; font-weight: 600; color: var(--muted); text-align: center; }
+  .tab.active { background: var(--navy); color: white; border-color: var(--navy); }
+  .conversation-row { border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; margin-top: 10px; cursor: pointer; }
+  .conversation-row:hover { border-color: var(--gold); }
+  .conversation-preview { color: var(--muted); font-size: 13px; margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .thread-header { display: flex; align-items: center; justify-content: space-between; }
+  .thread-messages { max-height: 360px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; margin: 12px 0; padding: 4px; }
+  .thread-msg { max-width: 75%; padding: 8px 12px; border-radius: 12px; font-size: 14px; }
+  .thread-msg.mine { align-self: flex-end; background: var(--navy); color: white; border-bottom-right-radius: 2px; }
+  .thread-msg.theirs { align-self: flex-start; background: #EEF0F2; color: var(--text); border-bottom-left-radius: 2px; }
+  .thread-msg-time { font-size: 10px; opacity: 0.7; margin-top: 3px; }
 </style>
 </head>
 <body>
@@ -89,15 +101,29 @@ firebase.initializeApp(firebaseConfig);
 // the backend on load and clears it if it's no longer good.
 let sessionToken = localStorage.getItem("session_token");
 let currentUserName = localStorage.getItem("display_name");
+let myUserId = localStorage.getItem("user_id") ? Number(localStorage.getItem("user_id")) : null;
+
+// Inbox view state — not persisted, resets on refresh (fine: the inbox
+// re-fetches whenever it's opened, see render()'s dispatch below).
+let currentTab = "browse"; // "browse" | "inbox"
+let activeConversationId = null; // other user's id, or null for the conversation list
 
 function render() {
   const app = document.getElementById("app");
   if (!sessionToken) {
     app.innerHTML = renderAuthCard();
-  } else {
-    app.innerHTML = renderMainApp();
+    return;
+  }
+  app.innerHTML = renderMainApp();
+  if (currentTab === "browse") {
     document.getElementById("browse-form").addEventListener("submit", onBrowse);
     document.getElementById("post-form").addEventListener("submit", onCreatePosting);
+  } else if (currentTab === "inbox") {
+    if (activeConversationId === null) {
+      loadConversations();
+    } else {
+      loadThread(activeConversationId);
+    }
   }
 }
 
@@ -110,7 +136,9 @@ async function init() {
       if (!res.ok) throw new Error("stale session");
       const data = await res.json();
       currentUserName = data.display_name || data.email.split("@")[0];
+      myUserId = data.id;
       localStorage.setItem("display_name", currentUserName);
+      localStorage.setItem("user_id", String(myUserId));
     } catch {
       clearSession();
     }
@@ -150,8 +178,10 @@ async function doGoogleSignIn() {
 
     sessionToken = data.session_token;
     currentUserName = data.display_name;
+    myUserId = data.id;
     localStorage.setItem("session_token", sessionToken);
     localStorage.setItem("display_name", currentUserName);
+    localStorage.setItem("user_id", String(myUserId));
     render();
   } catch (err) {
     if (err.code !== "auth/popup-closed-by-user") {
@@ -164,8 +194,10 @@ async function doGoogleSignIn() {
 function clearSession() {
   sessionToken = null;
   currentUserName = null;
+  myUserId = null;
   localStorage.removeItem("session_token");
   localStorage.removeItem("display_name");
+  localStorage.removeItem("user_id");
 }
 
 function signOut() {
@@ -183,6 +215,23 @@ function renderMainApp() {
       <div class="signout" onclick="signOut()">Sign out</div>
     </div>
 
+    <div class="tabs">
+      <button class="tab ${currentTab === "browse" ? "active" : ""}" onclick="switchTab('browse')">Find &amp; Post</button>
+      <button class="tab ${currentTab === "inbox" ? "active" : ""}" onclick="switchTab('inbox')">Inbox</button>
+    </div>
+
+    ${currentTab === "browse" ? renderBrowseAndPost() : renderInboxSection()}
+  `;
+}
+
+function switchTab(tab) {
+  currentTab = tab;
+  activeConversationId = null;
+  render();
+}
+
+function renderBrowseAndPost() {
+  return `
     <div class="card">
       <h3 style="margin-top:0">Find a partner</h3>
       <form id="browse-form">
@@ -221,6 +270,127 @@ function renderMainApp() {
       </form>
     </div>
   `;
+}
+
+// ---------- Inbox ----------
+
+function renderInboxSection() {
+  if (activeConversationId === null) {
+    return `
+      <div class="card">
+        <h3 style="margin-top:0">Inbox</h3>
+        <div id="inbox-list"><div class="muted-note">Loading…</div></div>
+      </div>
+    `;
+  }
+  return `
+    <div class="card">
+      <div class="thread-header">
+        <span class="signout" onclick="closeConversation()">&larr; Back to Inbox</span>
+      </div>
+      <h3 id="thread-name" style="margin:8px 0 0">…</h3>
+      <div id="thread-messages" class="thread-messages"><div class="muted-note">Loading…</div></div>
+      <textarea id="thread-input" placeholder="Type a message"></textarea>
+      <button class="primary" onclick="sendThreadMessage()">Send</button>
+      <div id="thread-send-msg"></div>
+    </div>
+  `;
+}
+
+async function loadConversations() {
+  const listEl = document.getElementById("inbox-list");
+  if (!listEl) return;
+  try {
+    const res = await fetch(`${API_BASE}/api/conversations`, {
+      headers: { Authorization: `Bearer ${sessionToken}` },
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "Failed to load inbox");
+
+    if (data.length === 0) {
+      listEl.innerHTML = `<div class="muted-note">No conversations yet — message someone from Find a partner to start one.</div>`;
+      return;
+    }
+    listEl.innerHTML = data.map(c => `
+      <div class="conversation-row" data-other-id="${c.other_user_id}">
+        <div class="posting-top">
+          <span class="posting-name">${escapeHtml(c.other_display_name || "A student")}</span>
+          <span class="muted-note">${formatTime(c.last_message_at)}</span>
+        </div>
+        <div class="conversation-preview">${escapeHtml(c.last_message)}</div>
+      </div>
+    `).join("");
+    listEl.querySelectorAll(".conversation-row").forEach(el => {
+      el.addEventListener("click", () => openConversation(Number(el.dataset.otherId)));
+    });
+  } catch (err) {
+    listEl.innerHTML = `<div class="error">${escapeHtml(err.message)}</div>`;
+  }
+}
+
+function openConversation(otherUserId) {
+  activeConversationId = otherUserId;
+  render();
+}
+
+function closeConversation() {
+  activeConversationId = null;
+  render();
+}
+
+async function loadThread(otherUserId) {
+  const nameEl = document.getElementById("thread-name");
+  const msgsEl = document.getElementById("thread-messages");
+  try {
+    const res = await fetch(`${API_BASE}/api/conversations/${otherUserId}`, {
+      headers: { Authorization: `Bearer ${sessionToken}` },
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "Failed to load conversation");
+
+    nameEl.textContent = data.other_display_name || "A student";
+    if (data.messages.length === 0) {
+      msgsEl.innerHTML = `<div class="muted-note">No messages yet — say hi!</div>`;
+    } else {
+      msgsEl.innerHTML = data.messages.map(m => `
+        <div class="thread-msg ${m.from_user_id === myUserId ? "mine" : "theirs"}">
+          <div>${escapeHtml(m.body)}</div>
+          <div class="thread-msg-time">${formatTime(m.created_at)}</div>
+        </div>
+      `).join("");
+      msgsEl.scrollTop = msgsEl.scrollHeight;
+    }
+  } catch (err) {
+    msgsEl.innerHTML = `<div class="error">${escapeHtml(err.message)}</div>`;
+  }
+}
+
+async function sendThreadMessage() {
+  const input = document.getElementById("thread-input");
+  const body = input.value.trim();
+  const msgEl = document.getElementById("thread-send-msg");
+  if (!body) return;
+  try {
+    const res = await fetch(`${API_BASE}/api/conversations/${activeConversationId}/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${sessionToken}` },
+      body: JSON.stringify({ body }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "Failed to send");
+    input.value = "";
+    msgEl.innerHTML = "";
+    loadThread(activeConversationId);
+  } catch (err) {
+    msgEl.innerHTML = `<div class="error">${escapeHtml(err.message)}</div>`;
+  }
+}
+
+function formatTime(sqliteTimestamp) {
+  if (!sqliteTimestamp) return "";
+  const d = new Date(sqliteTimestamp.replace(" ", "T") + "Z");
+  if (isNaN(d.getTime())) return sqliteTimestamp;
+  return d.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
 }
 
 async function onBrowse(e) {

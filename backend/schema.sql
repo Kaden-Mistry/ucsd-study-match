@@ -39,7 +39,7 @@ CREATE TABLE IF NOT EXISTS postings (
 
 CREATE TABLE IF NOT EXISTS messages (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    posting_id      INTEGER NOT NULL REFERENCES postings(id),
+    posting_id      INTEGER REFERENCES postings(id),  -- NULL for a direct reply not tied to a posting
     from_user_id    INTEGER NOT NULL REFERENCES users(id),
     to_user_id      INTEGER NOT NULL REFERENCES users(id),
     body            TEXT NOT NULL,

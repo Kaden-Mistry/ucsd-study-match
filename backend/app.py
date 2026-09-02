@@ -47,6 +47,31 @@ def migrate_db(conn: sqlite3.Connection):
         """CREATE UNIQUE INDEX IF NOT EXISTS idx_users_firebase_uid
            ON users(firebase_uid) WHERE firebase_uid IS NOT NULL"""
     )
+
+    # posting_id used to be NOT NULL (every message had to be about a
+    # posting). Direct inbox replies aren't tied to a posting, so it needs
+    # to allow NULL. SQLite can't ALTER a column's constraint in place, so
+    # an existing table with the old constraint gets rebuilt — this
+    # preserves all existing rows.
+    msg_cols = {row["name"]: row for row in conn.execute("PRAGMA table_info(messages)")}
+    if msg_cols and msg_cols["posting_id"]["notnull"] == 1:
+        conn.executescript(
+            """
+            ALTER TABLE messages RENAME TO messages_old;
+            CREATE TABLE messages (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                posting_id      INTEGER REFERENCES postings(id),
+                from_user_id    INTEGER NOT NULL REFERENCES users(id),
+                to_user_id      INTEGER NOT NULL REFERENCES users(id),
+                body            TEXT NOT NULL,
+                created_at      TEXT DEFAULT (datetime('now'))
+            );
+            INSERT INTO messages (id, posting_id, from_user_id, to_user_id, body, created_at)
+                SELECT id, posting_id, from_user_id, to_user_id, body, created_at FROM messages_old;
+            DROP TABLE messages_old;
+            CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(posting_id, from_user_id, to_user_id);
+            """
+        )
     conn.commit()
 
 
@@ -132,6 +157,18 @@ class MessageCreate(BaseModel):
     body: str
 
 
+class DirectMessageCreate(BaseModel):
+    body: str
+
+    @field_validator("body")
+    @classmethod
+    def not_blank(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("Message can't be empty")
+        return v
+
+
 # ---------- Auth endpoints ----------
 
 @app.post("/api/auth/google")
@@ -182,14 +219,18 @@ def auth_google(req: GoogleAuthRequest):
     row = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
     conn.close()
 
-    return {"session_token": token, "display_name": row["display_name"] or email.split("@")[0]}
+    return {
+        "id": row["id"],
+        "session_token": token,
+        "display_name": row["display_name"] or email.split("@")[0],
+    }
 
 
 @app.get("/api/me")
 def get_me(authorization: Optional[str] = Header(None)):
     """Lets the frontend restore 'signed in as X' after a page refresh without re-authenticating."""
     user = get_current_user(authorization)
-    return {"email": user["email"], "display_name": user["display_name"]}
+    return {"id": user["id"], "email": user["email"], "display_name": user["display_name"]}
 
 
 # ---------- Course/posting endpoints ----------
@@ -304,45 +345,90 @@ def send_message(req: MessageCreate, authorization: Optional[str] = Header(None)
     return {"message": "Sent"}
 
 
-@app.get("/api/messages/{posting_id}")
-def get_thread(posting_id: int, authorization: Optional[str] = Header(None)):
-    """All messages between the current user and the posting owner for this posting."""
-    user = get_current_user(authorization)
-    conn = get_db()
-    rows = conn.execute(
-        """SELECT m.*, u.display_name AS from_name
-           FROM messages m
-           JOIN users u ON u.id = m.from_user_id
-           WHERE m.posting_id = ?
-             AND (m.from_user_id = ? OR m.to_user_id = ?)
-           ORDER BY m.created_at ASC""",
-        (posting_id, user["id"], user["id"]),
-    ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
-
-
-@app.get("/api/inbox")
-def get_inbox(authorization: Optional[str] = Header(None)):
-    """Distinct conversations (by posting) the current user is part of, most recent first."""
+@app.get("/api/conversations")
+def list_conversations(authorization: Optional[str] = Header(None)):
+    """
+    The current user's conversations, one row per other person they've
+    exchanged messages with — regardless of which posting (if any) started
+    it — most recently active first.
+    """
     user = get_current_user(authorization)
     conn = get_db()
     rows = conn.execute(
         """
-        SELECT p.id AS posting_id, c.subject, c.catalog_number,
-               MAX(m.created_at) AS last_message_at,
-               COUNT(*) AS message_count
-        FROM messages m
-        JOIN postings p ON p.id = m.posting_id
-        JOIN courses c ON c.id = p.course_id
-        WHERE m.from_user_id = ? OR m.to_user_id = ?
-        GROUP BY p.id
-        ORDER BY last_message_at DESC
+        WITH convo AS (
+            SELECT
+                CASE WHEN from_user_id = :me THEN to_user_id ELSE from_user_id END AS other_user_id,
+                id, body, created_at,
+                ROW_NUMBER() OVER (
+                    PARTITION BY CASE WHEN from_user_id = :me THEN to_user_id ELSE from_user_id END
+                    ORDER BY created_at DESC, id DESC
+                ) AS rn
+            FROM messages
+            WHERE from_user_id = :me OR to_user_id = :me
+        )
+        SELECT c.other_user_id, u.display_name AS other_display_name,
+               c.body AS last_message, c.created_at AS last_message_at
+        FROM convo c
+        JOIN users u ON u.id = c.other_user_id
+        WHERE c.rn = 1
+        ORDER BY c.created_at DESC, c.id DESC
         """,
-        (user["id"], user["id"]),
+        {"me": user["id"]},
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+@app.get("/api/conversations/{other_user_id}")
+def get_conversation_thread(other_user_id: int, authorization: Optional[str] = Header(None)):
+    """The full message history between the current user and another user, oldest first."""
+    user = get_current_user(authorization)
+    conn = get_db()
+
+    other = conn.execute("SELECT id, display_name FROM users WHERE id = ?", (other_user_id,)).fetchone()
+    if other is None:
+        conn.close()
+        raise HTTPException(status_code=404, detail="User not found")
+
+    rows = conn.execute(
+        """SELECT id, from_user_id, to_user_id, body, created_at
+           FROM messages
+           WHERE (from_user_id = ? AND to_user_id = ?)
+              OR (from_user_id = ? AND to_user_id = ?)
+           ORDER BY created_at ASC, id ASC""",
+        (user["id"], other_user_id, other_user_id, user["id"]),
+    ).fetchall()
+    conn.close()
+    return {
+        "other_user_id": other["id"],
+        "other_display_name": other["display_name"],
+        "messages": [dict(r) for r in rows],
+    }
+
+
+@app.post("/api/conversations/{other_user_id}/messages")
+def send_direct_message(
+    other_user_id: int, req: DirectMessageCreate, authorization: Optional[str] = Header(None)
+):
+    """Reply within a conversation, independent of any specific posting."""
+    user = get_current_user(authorization)
+    if other_user_id == user["id"]:
+        raise HTTPException(status_code=400, detail="Can't message yourself")
+
+    conn = get_db()
+    other = conn.execute("SELECT id FROM users WHERE id = ?", (other_user_id,)).fetchone()
+    if other is None:
+        conn.close()
+        raise HTTPException(status_code=404, detail="User not found")
+
+    conn.execute(
+        "INSERT INTO messages (posting_id, from_user_id, to_user_id, body) VALUES (NULL, ?, ?, ?)",
+        (user["id"], other_user_id, req.body),
+    )
+    conn.commit()
+    conn.close()
+    return {"message": "Sent"}
 
 
 @app.get("/api/health")
