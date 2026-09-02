@@ -140,6 +140,25 @@ function render() {
 }
 
 async function init() {
+  // Completes a signInWithRedirect() flow if we just navigated back from
+  // Google's sign-in page (see doGoogleSignIn()). On a normal page load
+  // with no pending redirect, getRedirectResult() resolves with a null
+  // user rather than rejecting, so this is a no-op for most loads.
+  try {
+    const result = await firebase.auth().getRedirectResult();
+    if (result && result.user) {
+      const idToken = await result.user.getIdToken();
+      await finishGoogleSignIn(idToken);
+      return;
+    }
+  } catch (err) {
+    render(); // puts the auth card (and #auth-msg) in the DOM so there's somewhere to show this
+    const msgEl = document.getElementById("auth-msg");
+    if (msgEl) msgEl.innerHTML = `<div class="error">${escapeHtml(err.message)}</div>`;
+    firebase.auth().signOut().catch(() => {});
+    return;
+  }
+
   if (sessionToken) {
     try {
       const res = await fetch(`${API_BASE}/api/me`, {
@@ -155,6 +174,26 @@ async function init() {
       clearSession();
     }
   }
+  render();
+}
+
+// Exchanges a Firebase ID token for our own session token — shared by the
+// signInWithRedirect completion in init() above and (indirectly) by
+// doGoogleSignIn() kicking off that redirect in the first place.
+async function finishGoogleSignIn(idToken) {
+  const res = await fetch(`${API_BASE}/api/auth/google`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id_token: idToken }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.detail || "Sign-in failed");
+
+  sessionToken = data.session_token;
+  currentUserName = data.display_name;
+  myUserId = data.id;
+  localStorage.setItem("session_token", sessionToken);
+  localStorage.setItem("display_name", currentUserName);
+  localStorage.setItem("user_id", String(myUserId));
   render();
 }
 
@@ -198,27 +237,14 @@ async function doGoogleSignIn() {
   const provider = new firebase.auth.GoogleAuthProvider();
 
   try {
-    const result = await firebase.auth().signInWithPopup(provider);
-    const idToken = await result.user.getIdToken();
-
-    const res = await fetch(`${API_BASE}/api/auth/google`, {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id_token: idToken }),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || "Sign-in failed");
-
-    sessionToken = data.session_token;
-    currentUserName = data.display_name;
-    myUserId = data.id;
-    localStorage.setItem("session_token", sessionToken);
-    localStorage.setItem("display_name", currentUserName);
-    localStorage.setItem("user_id", String(myUserId));
-    render();
+    // Navigates away to Google's sign-in page and back, rather than
+    // opening a popup — signInWithPopup fails with auth/popup-blocked in
+    // many in-app/webview browsers (Reddit, Instagram, etc.) that block or
+    // can't open popup windows. The return trip is completed in init()
+    // via getRedirectResult(), not here — this function just kicks it off.
+    await firebase.auth().signInWithRedirect(provider);
   } catch (err) {
-    if (err.code !== "auth/popup-closed-by-user") {
-      msgEl.innerHTML = `<div class="error">${escapeHtml(err.message)}</div>`;
-    }
+    msgEl.innerHTML = `<div class="error">${escapeHtml(err.message)}</div>`;
     firebase.auth().signOut().catch(() => {});
   }
 }
