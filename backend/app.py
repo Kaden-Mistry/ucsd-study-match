@@ -31,7 +31,11 @@ from pydantic import BaseModel, field_validator
 # environment, so FIREBASE_PROJECT_ID below can find it.
 load_dotenv()
 
-DB_PATH = Path(__file__).parent / "study_match.db"
+# DATABASE_PATH lets a deploy point sqlite at a persistent volume (Railway's
+# default filesystem is ephemeral — without this, a redeploy silently wipes
+# the database). Falls back to a file next to this script for local dev,
+# where no such volume exists.
+DB_PATH = Path(os.environ.get("DATABASE_PATH", str(Path(__file__).parent / "study_match.db")))
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
 
