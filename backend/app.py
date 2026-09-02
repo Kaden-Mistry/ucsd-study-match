@@ -71,10 +71,6 @@ def init_db_if_needed():
 FIREBASE_PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID")
 _google_auth_request = google_auth_requests.Request()
 
-# Only these domains can sign in — adjust if grad/extension students use a
-# different subdomain (e.g. checking with UCSD's actual list is worth doing).
-ALLOWED_EMAIL_DOMAINS = ["ucsd.edu"]
-
 app = FastAPI(title="UCSD Study/Project Partner Matcher")
 
 
@@ -144,12 +140,9 @@ def auth_google(req: GoogleAuthRequest):
     Exchange a Firebase (Google Sign-In) ID token for our own session token.
 
     The ID token's signature and claims are checked directly against
-    Google's public certs — this proves the user owns a Google account with
-    a verified email, but says nothing about domain, so that's checked
-    separately below against ALLOWED_EMAIL_DOMAINS. That check is what
-    actually restricts sign-in to UCSD accounts; the frontend's `hd` hint
-    on the Google account picker is just a UX nicety, not a security
-    boundary, since it's client-controlled.
+    Google's public certs — this proves the user owns the Google account
+    and that its email is verified. Any verified Google account is accepted;
+    there's no domain restriction.
     """
     if not FIREBASE_PROJECT_ID:
         raise HTTPException(status_code=500, detail="Server is missing FIREBASE_PROJECT_ID configuration")
@@ -167,13 +160,6 @@ def auth_google(req: GoogleAuthRequest):
         raise HTTPException(status_code=403, detail="Google account email is not verified")
 
     email = (claims.get("email") or "").lower()
-    domain = email.split("@")[-1]
-    if domain not in ALLOWED_EMAIL_DOMAINS:
-        raise HTTPException(
-            status_code=403,
-            detail=f"Sign-in is restricted to {', '.join(ALLOWED_EMAIL_DOMAINS)} accounts",
-        )
-
     firebase_uid = claims.get("sub")
     google_name = claims.get("name")
     token = secrets.token_urlsafe(32)

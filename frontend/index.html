@@ -51,7 +51,7 @@
 
 <header>
   <h1>Study & Project Match</h1>
-  <p>UCSD students only — verified by .edu email</p>
+  <p>Sign in with Google to find a study or project partner</p>
 </header>
 
 <main id="app"></main>
@@ -124,8 +124,7 @@ function renderAuthCard() {
   return `
     <div class="card">
       <p style="margin-top:0;color:var(--muted);font-size:13px">
-        Sign in with your UCSD Google account to continue. Only @ucsd.edu
-        accounts can sign in.
+        Sign in with any Google account to continue.
       </p>
       <button class="primary" onclick="doGoogleSignIn()">Sign in with Google</button>
       <div id="auth-msg"></div>
@@ -137,10 +136,6 @@ async function doGoogleSignIn() {
   const msgEl = document.getElementById("auth-msg");
   msgEl.innerHTML = "";
   const provider = new firebase.auth.GoogleAuthProvider();
-  // Hints Google's account picker toward ucsd.edu accounts — a UX nicety
-  // only, not enforcement (a user could still pick another account, so the
-  // backend independently checks the email domain on every sign-in).
-  provider.setCustomParameters({ hd: "ucsd.edu" });
 
   try {
     const result = await firebase.auth().signInWithPopup(provider);
