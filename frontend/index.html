@@ -178,8 +178,9 @@ async function init() {
 }
 
 // Exchanges a Firebase ID token for our own session token — shared by the
-// signInWithRedirect completion in init() above and (indirectly) by
-// doGoogleSignIn() kicking off that redirect in the first place.
+// popup sign-in path in doGoogleSignIn() below and the signInWithRedirect
+// completion in init() above (its fallback path, for browsers that can't
+// do popups).
 async function finishGoogleSignIn(idToken) {
   const res = await fetch(`${API_BASE}/api/auth/google`, {
     method: "POST", headers: { "Content-Type": "application/json" },
@@ -237,14 +238,28 @@ async function doGoogleSignIn() {
   const provider = new firebase.auth.GoogleAuthProvider();
 
   try {
-    // Navigates away to Google's sign-in page and back, rather than
-    // opening a popup — signInWithPopup fails with auth/popup-blocked in
-    // many in-app/webview browsers (Reddit, Instagram, etc.) that block or
-    // can't open popup windows. The return trip is completed in init()
-    // via getRedirectResult(), not here — this function just kicks it off.
-    await firebase.auth().signInWithRedirect(provider);
+    // Try a popup first — it completes right here without leaving the
+    // page. Only the specific failures typical of in-app/webview browsers
+    // (Reddit, Instagram, etc.), which block or can't open popup windows
+    // at all, fall back to a full-page redirect below.
+    const result = await firebase.auth().signInWithPopup(provider);
+    const idToken = await result.user.getIdToken();
+    await finishGoogleSignIn(idToken);
   } catch (err) {
-    msgEl.innerHTML = `<div class="error">${escapeHtml(err.message)}</div>`;
+    if (err.code === "auth/popup-blocked" || err.code === "auth/operation-not-supported-in-this-environment") {
+      try {
+        // Navigates away to Google's sign-in page and back — the return
+        // trip is completed in init() via getRedirectResult(), not here.
+        await firebase.auth().signInWithRedirect(provider);
+      } catch (redirectErr) {
+        msgEl.innerHTML = `<div class="error">${escapeHtml(redirectErr.message)}</div>`;
+        firebase.auth().signOut().catch(() => {});
+      }
+      return;
+    }
+    if (err.code !== "auth/popup-closed-by-user") {
+      msgEl.innerHTML = `<div class="error">${escapeHtml(err.message)}</div>`;
+    }
     firebase.auth().signOut().catch(() => {});
   }
 }
